@@ -764,6 +764,7 @@ def check_url(
     verify_ssl: bool,
     custom_headers: Dict[str, str],
     sapi: str,
+    probe_repeats: int = 1,
 ) -> dict:
     result = base_result(host)
     result["tested_url"] = target_url
@@ -835,65 +836,70 @@ def check_url(
     for index, (size_mib, parts) in enumerate(PROBES, start=1):
         body = build_probe_body(size_mib, parts)
         probe_headers = request_headers(custom_headers, PROBE_BOUNDARY)
-        probe = send_post(
-            target_url,
-            body,
-            PROBE_BOUNDARY,
-            custom_headers,
-            timeout,
-            verify_ssl,
-        )
-        probe_metadata = response_metadata(probe)
-        probe_metadata.update({"probe": index, "size_mib": size_mib, "parts": parts})
-        result["probes"].append(probe_metadata)
-        result["request"] = request_dump(
-            target_url,
-            probe_headers,
-            len(body),
-            f"php2shell probe {index}: {size_mib} MiB, {parts} parts, "
-            f"{NESTED_KEYS} nested keys",
-        )
-        apply_response(result, probe)
-
-        if probe.powered_by:
-            powered_by = probe.powered_by
-        result["powered_by"] = powered_by or None
-
-        if probe.error:
-            result["verdict"] = "INCONCLUSIVE"
-            result["error"] = (
-                f"probe {index} failed before a response was read: {probe.error}"
+        for attempt in range(1, probe_repeats + 1):
+            probe = send_post(
+                target_url,
+                body,
+                PROBE_BOUNDARY,
+                custom_headers,
+                timeout,
+                verify_ssl,
             )
-            result["reason"] = result["error"]
-            return result
-
-        if probe.status_code in REJECTED_STATUSES:
-            rejected = True
-            rejected_reason = (
-                f"probe {index} was rejected with HTTP {probe.status_code} "
-                "before PHP parsed it"
+            probe_metadata = response_metadata(probe)
+            probe_metadata.update(
+                {"probe": index, "size_mib": size_mib, "parts": parts, "attempt": attempt}
             )
-            break
-
-        detected_sapi, signal = crash_signal(control, probe, sapi)
-        if signal:
-            result["vulnerable"] = True
-            result["verdict"] = "VULNERABLE"
-            result["sapi"] = detected_sapi
-            result["reason"] = (
-                f"probe {index} ({size_mib} MiB, {parts} parts) crashed the "
-                f"request handler: {signal}"
+            result["probes"].append(probe_metadata)
+            result["request"] = request_dump(
+                target_url,
+                probe_headers,
+                len(body),
+                f"php2shell probe {index}: {size_mib} MiB, {parts} parts, "
+                f"{NESTED_KEYS} nested keys",
             )
-            return result
+            apply_response(result, probe)
 
-        if version_verdict(powered_by) == "FIXED":
-            result["vulnerable"] = False
-            result["verdict"] = "FIXED"
-            result["reason"] = (
-                "no crash observed and X-Powered-By reports a patched release: "
-                + powered_by
-            )
-            return result
+            if probe.powered_by:
+                powered_by = probe.powered_by
+            result["powered_by"] = powered_by or None
+
+            if probe.error:
+                result["verdict"] = "INCONCLUSIVE"
+                result["error"] = (
+                    f"probe {index} failed before a response was read: {probe.error}"
+                )
+                result["reason"] = result["error"]
+                return result
+
+            if probe.status_code in REJECTED_STATUSES:
+                # Keep probing: an app-level rejection (e.g. CSRF middleware)
+                # is emitted AFTER PHP parsed the request body, so later
+                # probes can still observe a crash.
+                rejected = True
+                rejected_reason = (
+                    f"probe {index} was rejected with HTTP {probe.status_code}"
+                )
+                continue
+
+            detected_sapi, signal = crash_signal(control, probe, sapi)
+            if signal:
+                result["vulnerable"] = True
+                result["verdict"] = "VULNERABLE"
+                result["sapi"] = detected_sapi
+                result["reason"] = (
+                    f"probe {index} ({size_mib} MiB, {parts} parts) crashed the "
+                    f"request handler: {signal}"
+                )
+                return result
+
+            if version_verdict(powered_by) == "FIXED":
+                result["vulnerable"] = False
+                result["verdict"] = "FIXED"
+                result["reason"] = (
+                    "no crash observed and X-Powered-By reports a patched release: "
+                    + powered_by
+                )
+                return result
 
     by_version = version_verdict(powered_by)
     result["powered_by"] = powered_by or None
@@ -932,6 +938,7 @@ def check_vulnerability(
     custom_headers: Optional[Dict[str, str]] = None,
     sapi: str = "auto",
     paths: Optional[List[str]] = None,
+    probe_repeats: int = 1,
 ) -> dict:
     display_host = safe_url_label(host)
     try:
@@ -955,6 +962,7 @@ def check_vulnerability(
             verify_ssl,
             custom_headers or {},
             sapi,
+            probe_repeats=probe_repeats,
         )
         if result["vulnerable"] is True:
             return result
@@ -1128,6 +1136,12 @@ Examples:
     parser.add_argument(
         "--path-file", help="File containing paths to test (one per line)"
     )
+    parser.add_argument(
+        "--probe-repeats",
+        type=int,
+        default=1,
+        help="Send each probe N times to catch borderline OOM crashes (default: 1)",
+    )
     return parser
 
 
@@ -1137,6 +1151,8 @@ def main() -> None:
         raise SystemExit("--threads must be at least 1")
     if args.timeout < 1:
         raise SystemExit("--timeout must be at least 1")
+    if args.probe_repeats < 1:
+        raise SystemExit("--probe-repeats must be at least 1")
 
     if args.no_color or not sys.stdout.isatty():
         for name in ("RED", "GREEN", "YELLOW", "CYAN", "WHITE", "BOLD", "RESET"):
@@ -1195,6 +1211,7 @@ def main() -> None:
                 custom_headers=custom_headers,
                 sapi=args.sapi,
                 paths=paths,
+                probe_repeats=args.probe_repeats,
             )
         except Exception as exc:  # Keep one bad target from aborting a scan.
             result = base_result(safe_url_label(host))
